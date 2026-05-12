@@ -1,12 +1,22 @@
 # archiver — 免费 macOS 解压缩软件
 
-基于 [egui](https://github.com/emilk/egui) / [eframe](https://github.com/emilk/egui/tree/master/crates/eframe) 的桌面小工具：在「解压」与「压缩」两种模式间切换，用系统文件对话框选择路径，压缩模式支持拖入文件或文件夹。
+基于 [egui](https://github.com/emilk/egui) / [eframe](https://github.com/emilk/egui/tree/master/crates/eframe) 的桌面小工具：在「解压」与「压缩」两种模式间切换，用系统文件对话框选择路径，支持拖入文件、文件夹和多个压缩包。
 
 ## 功能概览
 
 ### 解压
 
-根据压缩包扩展名识别格式，解压到指定目录（可选默认目录）。解压时对包内路径做校验，**拒绝绝对路径与 `..` 穿越**，降低 Zip Slip 类风险。
+根据压缩包扩展名识别格式，支持单个或批量解压到指定目录（可选默认目录）。解压时对包内路径做校验，**拒绝绝对路径与 `..` 穿越**，降低 Zip Slip 类风险。
+
+解压模式支持：
+
+- 批量选择或拖入多个压缩包。
+- 解压前预览压缩包内容、文件数量、大小与加密状态。
+- 进度条与当前处理文件名。
+- 覆盖策略：自动重命名、跳过、覆盖。
+- 加密 ZIP / RAR / 7z 的密码输入（取决于底层格式与库支持）。
+- 完成后打开输出位置、在 Finder 中显示、复制输出路径。
+- 默认输出目录使用压缩包原名；如果目录已存在，会自动追加序号避免混入旧文件。
 
 | 格式 | 扩展名示例 |
 |------|------------|
@@ -25,6 +35,14 @@
 - 输出格式由保存文件名决定：
   - **ZIP**（Deflate 等，见 `Cargo.toml` 中 `zip` 特性）
   - **tar.gz**（`.tar.gz` 或 `.tgz`）
+  - **tar.bz2**（`.tar.bz2`、`.tbz2`、`.tbz`）
+  - **tar.xz**（`.tar.xz`、`.txz`）
+  - **tar.zst**（`.tar.zst`、`.tzst`）
+- 压缩选项：
+  - 快速 / 均衡 / 最高压缩级别。
+  - 是否保留文件夹顶层目录。
+  - 是否包含隐藏文件。
+  - 是否排除 `.DS_Store` 与 `__MACOSX`。
 
 压缩与解压均在后台线程执行，界面可显示日志；进行中会禁用相关操作。
 
@@ -49,13 +67,22 @@ cargo build --release
 | `src/main.rs` | 窗口、模式切换、文件选择与 UI |
 | `src/theme.rs` | 字体与浅色视觉主题 |
 | `src/extract/mod.rs` | 解压实现与各归档格式分支 |
-| `src/compress/mod.rs` | ZIP / tar.gz 压缩实现 |
+| `src/compress/mod.rs` | ZIP / tar.gz / tar.bz2 / tar.xz / tar.zst 压缩实现 |
 
 ## 依赖说明（简要）
 
 - **ZIP / TAR 及压缩算法**：`zip`、`tar`、`flate2`、`bzip2`、`xz2`、`zstd` 等。
 - **7z**：`sevenz-rust`。
 - **RAR**：`unrar` crate（与上游 RAR 解压能力及许可相关；分发二进制前请自行确认合规）。
+
+## macOS 发布说明
+
+当前项目可通过 `cargo build --release` 得到可执行文件。若要作为完整 macOS 应用分发，建议继续补充：
+
+- `.app` Bundle、应用图标、`Info.plist`。
+- 开发者签名与 Apple 公证。
+- DMG 安装包。
+- Finder 右键“用本软件解压/压缩”的系统服务或扩展。
 
 ## 许可
 

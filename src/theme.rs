@@ -195,3 +195,11 @@ pub fn main_panel_frame() -> egui::Frame {
         })
         .inner_margin(egui::Margin::same(22.0))
 }
+
+pub fn section_frame() -> egui::Frame {
+    egui::Frame::none()
+        .fill(Color32::from_rgb(248, 250, 252))
+        .rounding(Rounding::same(12.0))
+        .stroke(Stroke::new(1.0, CARD_STROKE))
+        .inner_margin(egui::Margin::symmetric(14.0, 12.0))
+}
