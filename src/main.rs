@@ -6,10 +6,17 @@ mod theme;
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+    mpsc::{self, Receiver, Sender},
+};
 
 use eframe::egui::{self, Align2, Color32, FontId, RichText, Sense, Vec2};
-use compress::{CompressFormat, CompressOptions, CompressionLevel, compress_with_options};
+use compress::{
+    CompressFormat, CompressOptions, CompressStats, CompressionLevel, compress_with_options,
+    estimate_sources,
+};
 use extract::{
     ArchiveEntryPreview, ArchiveKind, ExtractOptions, ExtractProgress, OverwritePolicy,
     extract_with_options, list_archive,
@@ -44,7 +51,16 @@ enum WorkerMsg {
 
 struct WorkerOutcome {
     message: String,
-    output: Option<PathBuf>,
+    outputs: Vec<PathBuf>,
+}
+
+struct PreviewOutcome {
+    status: String,
+    entries: Vec<ArchiveEntryPreview>,
+}
+
+enum PreviewMsg {
+    Done(Result<PreviewOutcome, String>),
 }
 
 struct ArchiverApp {
@@ -55,7 +71,11 @@ struct ArchiverApp {
     password: String,
     preview_entries: Vec<ArchiveEntryPreview>,
     preview_status: String,
+    preview_busy: bool,
+    preview_rx: Option<Receiver<PreviewMsg>>,
+    _preview_tx: Option<Sender<PreviewMsg>>,
     last_output: Option<PathBuf>,
+    last_outputs: Vec<PathBuf>,
     progress_current: usize,
     progress_total: Option<usize>,
     progress_file: String,
@@ -65,8 +85,12 @@ struct ArchiverApp {
     compress_keep_top_level: bool,
     compress_include_hidden: bool,
     compress_exclude_mac_metadata: bool,
+    compress_exclude_common_dev_dirs: bool,
+    compress_stats: Option<CompressStats>,
+    compress_stats_status: String,
     log: String,
     busy: bool,
+    cancel_flag: Option<Arc<AtomicBool>>,
     worker_rx: Option<Receiver<WorkerMsg>>,
     _worker_tx: Option<Sender<WorkerMsg>>,
 }
@@ -83,7 +107,11 @@ impl ArchiverApp {
             password: String::new(),
             preview_entries: Vec::new(),
             preview_status: String::new(),
+            preview_busy: false,
+            preview_rx: None,
+            _preview_tx: None,
             last_output: None,
+            last_outputs: Vec::new(),
             progress_current: 0,
             progress_total: None,
             progress_file: String::new(),
@@ -91,10 +119,14 @@ impl ArchiverApp {
             compress_output: None,
             compress_level: CompressionLevel::Balanced,
             compress_keep_top_level: true,
-            compress_include_hidden: true,
+            compress_include_hidden: false,
             compress_exclude_mac_metadata: true,
+            compress_exclude_common_dev_dirs: true,
+            compress_stats: None,
+            compress_stats_status: String::new(),
             log: String::new(),
             busy: false,
+            cancel_flag: None,
             worker_rx: None,
             _worker_tx: None,
         }
@@ -215,6 +247,8 @@ impl ArchiverApp {
             return;
         }
         self.compress_sources.push(p);
+        self.compress_stats = None;
+        self.compress_stats_status.clear();
     }
 
     fn pick_compress_file(&mut self) {
@@ -261,19 +295,26 @@ impl ArchiverApp {
         self.busy = true;
         self.log.clear();
         self.last_output = None;
+        self.last_outputs.clear();
         self.progress_current = 0;
         self.progress_total = None;
         self.progress_file.clear();
         self.append_log(format!("开始解压 {} 个压缩包。", archives.len()));
+        let cancel_flag = Arc::new(AtomicBool::new(false));
+        self.cancel_flag = Some(cancel_flag.clone());
 
         let (tx, rx) = mpsc::channel();
         self.worker_rx = Some(rx);
         self._worker_tx = Some(tx.clone());
 
         std::thread::spawn(move || {
-            let mut last_output = None;
+            let mut outputs = Vec::new();
             let mut completed = 0usize;
             for archive in archives {
+                if cancel_flag.load(Ordering::Relaxed) {
+                    let _ = tx.send(WorkerMsg::Done(Err("任务已取消".to_string())));
+                    return;
+                }
                 let Some(kind) = ArchiveKind::from_path(&archive) else {
                     let _ = tx.send(WorkerMsg::Done(Err(format!(
                         "不支持的扩展名: {}",
@@ -298,6 +339,7 @@ impl ArchiverApp {
                 let options = ExtractOptions {
                     overwrite,
                     password: password.clone(),
+                    cancel: Some(cancel_flag.clone()),
                 };
                 let progress_tx = tx.clone();
                 let res = extract_with_options(&archive, &out, kind, options, |progress| {
@@ -308,12 +350,12 @@ impl ArchiverApp {
                     return;
                 }
                 completed += 1;
-                last_output = Some(out);
+                outputs.push(out);
             }
             let message = format!("完成。已解压 {completed} 个压缩包。");
             let _ = tx.send(WorkerMsg::Done(Ok(WorkerOutcome {
                 message,
-                output: last_output,
+                outputs,
             })));
         });
     }
@@ -333,18 +375,23 @@ impl ArchiverApp {
         };
 
         let sources = self.compress_sources.clone();
+        let cancel_flag = Arc::new(AtomicBool::new(false));
         let options = CompressOptions {
             level: self.compress_level,
             keep_top_level: self.compress_keep_top_level,
             include_hidden: self.compress_include_hidden,
             exclude_mac_metadata: self.compress_exclude_mac_metadata,
+            exclude_common_dev_dirs: self.compress_exclude_common_dev_dirs,
+            cancel: Some(cancel_flag.clone()),
         };
         self.busy = true;
         self.log.clear();
         self.last_output = None;
+        self.last_outputs.clear();
         self.progress_current = 0;
         self.progress_total = None;
         self.progress_file.clear();
+        self.cancel_flag = Some(cancel_flag);
         self.append_log(format!(
             "压缩 {} → {}",
             fmt.label(),
@@ -359,7 +406,7 @@ impl ArchiverApp {
             let res = compress_with_options(&sources, &out, fmt, options)
                 .map(|_| WorkerOutcome {
                     message: "完成。压缩包已生成。".to_string(),
-                    output: Some(out),
+                    outputs: vec![out],
                 })
                 .map_err(|e| e.to_string());
             let _ = tx.send(WorkerMsg::Done(res));
@@ -392,12 +439,49 @@ impl ArchiverApp {
             self.busy = false;
             self.worker_rx = None;
             self._worker_tx = None;
+            self.cancel_flag = None;
             match res {
                 Ok(outcome) => {
-                    self.last_output = outcome.output;
+                    self.last_output = outcome.outputs.last().cloned();
+                    self.last_outputs = outcome.outputs;
                     self.append_log(outcome.message);
                 }
                 Err(e) => self.append_log(format!("错误: {}", Self::friendly_error(&e))),
+            }
+            ctx.request_repaint();
+        }
+    }
+
+    fn cancel_current_task(&mut self) {
+        if let Some(flag) = &self.cancel_flag {
+            flag.store(true, Ordering::Relaxed);
+            self.append_log("正在取消任务…");
+        }
+    }
+
+    fn poll_preview(&mut self, ctx: &egui::Context) {
+        let Some(rx) = &self.preview_rx else {
+            return;
+        };
+        let mut done = None;
+        while let Ok(msg) = rx.try_recv() {
+            match msg {
+                PreviewMsg::Done(res) => done = Some(res),
+            }
+        }
+        if let Some(res) = done {
+            self.preview_busy = false;
+            self.preview_rx = None;
+            self._preview_tx = None;
+            match res {
+                Ok(outcome) => {
+                    self.preview_status = outcome.status;
+                    self.preview_entries = outcome.entries;
+                }
+                Err(e) => {
+                    self.preview_entries.clear();
+                    self.preview_status = format!("预览失败: {}", Self::friendly_error(&e));
+                }
             }
             ctx.request_repaint();
         }
@@ -414,6 +498,12 @@ impl ArchiverApp {
         if lower.contains("no space") || error.contains("空间") {
             return "磁盘空间不足，请清理空间后重试。".to_string();
         }
+        if error.contains("任务已取消") || lower.contains("cancel") {
+            return "任务已取消。".to_string();
+        }
+        if lower.contains("invalid") || error.contains("损坏") || error.contains("读取") {
+            return "压缩包可能已损坏，或格式与扩展名不匹配。".to_string();
+        }
         error.to_string()
     }
 
@@ -426,27 +516,67 @@ impl ArchiverApp {
             self.preview_status = "当前文件格式不支持预览。".to_string();
             return;
         };
-        let password = self
-            .password
-            .trim()
-            .is_empty()
-            .then_some(None)
-            .unwrap_or(Some(self.password.as_str()));
-        match list_archive(&archive, kind, password) {
-            Ok(entries) => {
-                let total_size: u64 = entries.iter().filter_map(|e| e.size).sum();
-                self.preview_status = format!(
-                    "{} · {} 个条目 · 约 {}",
-                    kind.label(),
-                    entries.len(),
-                    Self::human_size(total_size)
+        let password = if self.password.trim().is_empty() {
+            None
+        } else {
+            Some(self.password.clone())
+        };
+        self.preview_busy = true;
+        self.preview_entries.clear();
+        self.preview_status = "正在读取目录…".to_string();
+        let (tx, rx) = mpsc::channel();
+        self.preview_rx = Some(rx);
+        self._preview_tx = Some(tx.clone());
+        std::thread::spawn(move || {
+            let res = list_archive(&archive, kind, password.as_deref())
+                .map(|entries| {
+                    let total_size: u64 = entries.iter().filter_map(|e| e.size).sum();
+                    PreviewOutcome {
+                        status: format!(
+                            "{} · {} 个条目 · 约 {}",
+                            kind.label(),
+                            entries.len(),
+                            Self::human_size(total_size)
+                        ),
+                        entries,
+                    }
+                })
+                .map_err(|e| e.to_string());
+            let _ = tx.send(PreviewMsg::Done(res));
+        });
+    }
+
+    fn refresh_compress_stats(&mut self) {
+        if self.compress_sources.is_empty() {
+            self.compress_stats = None;
+            self.compress_stats_status = "暂无待压缩内容".to_string();
+            return;
+        }
+        let options = self.current_compress_options(None);
+        match estimate_sources(&self.compress_sources, options) {
+            Ok(stats) => {
+                self.compress_stats = Some(stats);
+                self.compress_stats_status = format!(
+                    "{} 个文件 · 约 {}",
+                    stats.file_count,
+                    Self::human_size(stats.total_bytes)
                 );
-                self.preview_entries = entries;
             }
             Err(e) => {
-                self.preview_entries.clear();
-                self.preview_status = format!("预览失败: {}", Self::friendly_error(&e.to_string()));
+                self.compress_stats = None;
+                self.compress_stats_status = format!("统计失败: {}", Self::friendly_error(&e.to_string()));
             }
+        }
+    }
+
+    fn current_compress_options(&self, cancel: Option<Arc<AtomicBool>>) -> CompressOptions {
+        CompressOptions {
+            level: self.compress_level,
+            keep_top_level: self.compress_keep_top_level,
+            include_hidden: self.compress_include_hidden,
+            exclude_mac_metadata: self.compress_exclude_mac_metadata,
+            exclude_common_dev_dirs: self.compress_exclude_common_dev_dirs,
+            cancel,
         }
     }
 
@@ -670,7 +800,7 @@ impl ArchiverApp {
         theme::section_frame().show(ui, |ui| {
             ui.spacing_mut().item_spacing = Vec2::new(12.0, 10.0);
             ui.horizontal(|ui| {
-                let can_preview = !self.archive_paths.is_empty() && !self.busy;
+                let can_preview = !self.archive_paths.is_empty() && !self.busy && !self.preview_busy;
                 if ui
                     .add_enabled(
                         can_preview,
@@ -679,6 +809,9 @@ impl ArchiverApp {
                     .clicked()
                 {
                     self.preview_selected_archive();
+                }
+                if self.preview_busy {
+                    ui.spinner();
                 }
                 if !self.preview_status.is_empty() {
                     ui.label(
@@ -725,38 +858,73 @@ impl ArchiverApp {
             }
         });
 
-        if let Some(output) = self.last_output.clone() {
+        if !self.last_outputs.is_empty() {
             ui.add_space(12.0);
             theme::section_frame().show(ui, |ui| {
                 ui.horizontal_wrapped(|ui| {
                     ui.label(RichText::new("完成后操作").size(12.0).color(theme::text_muted()));
                     if ui.button("打开输出位置").clicked() {
-                        Self::open_in_finder(&output);
+                        if let Some(first) = self.last_outputs.first() {
+                            Self::open_in_finder(first);
+                        }
                     }
-                    if ui.button("在 Finder 中显示").clicked() {
-                        Self::reveal_in_finder(&output);
+                    if ui.button("打开父目录").clicked() {
+                        if let Some(parent) = self.last_outputs.first().and_then(|p| p.parent()) {
+                            Self::open_in_finder(parent);
+                        }
                     }
                     if ui.button("复制路径").clicked() {
-                        ui.ctx().copy_text(output.display().to_string());
+                        ui.ctx().copy_text(
+                            self.last_outputs
+                                .iter()
+                                .map(|p| p.display().to_string())
+                                .collect::<Vec<_>>()
+                                .join("\n"),
+                        );
                     }
                 });
+                if self.last_outputs.len() > 1 {
+                    ui.add_space(8.0);
+                    egui::ScrollArea::vertical()
+                        .max_height(90.0)
+                        .auto_shrink([false, true])
+                        .show(ui, |ui| {
+                            for output in &self.last_outputs {
+                                ui.label(
+                                    RichText::new(output.display().to_string())
+                                        .size(12.0)
+                                        .family(egui::FontFamily::Monospace)
+                                        .color(theme::INK),
+                                );
+                            }
+                        });
+                }
             });
         }
 
         ui.add_space(16.0);
 
-        let can_run = !self.archive_paths.is_empty() && !self.busy;
-        if ui
-            .add_enabled_ui(can_run, |ui| {
-                ui.add_sized(
-                    [ui.available_width(), 46.0],
-                    theme::primary_action_button("解压"),
-                )
-            })
-            .inner
-            .clicked()
-        {
-            self.start_extract();
+        if self.busy {
+            if ui
+                .add_sized([ui.available_width(), 42.0], egui::Button::new("取消当前任务"))
+                .clicked()
+            {
+                self.cancel_current_task();
+            }
+        } else {
+            let can_run = !self.archive_paths.is_empty();
+            if ui
+                .add_enabled_ui(can_run, |ui| {
+                    ui.add_sized(
+                        [ui.available_width(), 46.0],
+                        theme::primary_action_button("解压"),
+                    )
+                })
+                .inner
+                .clicked()
+            {
+                self.start_extract();
+            }
         }
     }
 
@@ -817,6 +985,8 @@ impl ArchiverApp {
                         .clicked()
                     {
                         self.compress_sources.clear();
+                        self.compress_stats = None;
+                        self.compress_stats_status.clear();
                     }
                 });
             });
@@ -878,9 +1048,43 @@ impl ArchiverApp {
                         }
                         if let Some(i) = remove_idx {
                             self.compress_sources.remove(i);
+                            self.compress_stats = None;
+                            self.compress_stats_status.clear();
                         }
                     }
                 });
+        });
+
+        ui.add_space(12.0);
+        theme::section_frame().show(ui, |ui| {
+            ui.spacing_mut().item_spacing = Vec2::new(12.0, 10.0);
+            ui.horizontal_wrapped(|ui| {
+                if ui
+                    .add_enabled(
+                        !self.compress_sources.is_empty() && !self.busy,
+                        egui::Button::new(RichText::new("统计待压缩内容").size(13.0)),
+                    )
+                    .clicked()
+                {
+                    self.refresh_compress_stats();
+                }
+                let status = if self.compress_stats_status.is_empty() {
+                    "压缩前可先统计文件数量和原始大小"
+                } else {
+                    &self.compress_stats_status
+                };
+                ui.label(RichText::new(status).size(12.0).color(theme::text_muted()));
+            });
+            if self
+                .compress_stats
+                .is_some_and(|stats| stats.total_bytes > 1024 * 1024 * 1024)
+            {
+                ui.label(
+                    RichText::new("提示：待压缩内容超过 1 GB，可能耗时较久。")
+                        .size(12.0)
+                        .color(Color32::from_rgb(180, 83, 9)),
+                );
+            }
         });
 
         ui.add_space(12.0);
@@ -940,23 +1144,35 @@ impl ArchiverApp {
             ui.checkbox(&mut self.compress_keep_top_level, "保留文件夹顶层目录");
             ui.checkbox(&mut self.compress_include_hidden, "包含隐藏文件");
             ui.checkbox(&mut self.compress_exclude_mac_metadata, "排除 .DS_Store / __MACOSX");
+            ui.checkbox(
+                &mut self.compress_exclude_common_dev_dirs,
+                "排除常见开发目录（.git / target / node_modules 等）",
+            );
         });
 
-        if let Some(output) = self.last_output.clone() {
+        if !self.last_outputs.is_empty() {
             ui.add_space(12.0);
             theme::section_frame().show(ui, |ui| {
                 ui.horizontal_wrapped(|ui| {
                     ui.label(RichText::new("完成后操作").size(12.0).color(theme::text_muted()));
                     if ui.button("打开输出位置").clicked() {
-                        if let Some(parent) = output.parent() {
+                        if let Some(parent) = self.last_outputs.first().and_then(|p| p.parent()) {
                             Self::open_in_finder(parent);
                         }
                     }
                     if ui.button("在 Finder 中显示").clicked() {
-                        Self::reveal_in_finder(&output);
+                        if let Some(output) = self.last_outputs.first() {
+                            Self::reveal_in_finder(output);
+                        }
                     }
                     if ui.button("复制路径").clicked() {
-                        ui.ctx().copy_text(output.display().to_string());
+                        ui.ctx().copy_text(
+                            self.last_outputs
+                                .iter()
+                                .map(|p| p.display().to_string())
+                                .collect::<Vec<_>>()
+                                .join("\n"),
+                        );
                     }
                 });
             });
@@ -964,18 +1180,27 @@ impl ArchiverApp {
 
         ui.add_space(16.0);
 
-        let can_run = !self.compress_sources.is_empty() && self.compress_output.is_some() && !self.busy;
-        if ui
-            .add_enabled_ui(can_run, |ui| {
-                ui.add_sized(
-                    [ui.available_width(), 46.0],
-                    theme::primary_action_button("压缩"),
-                )
-            })
-            .inner
-            .clicked()
-        {
-            self.start_compress();
+        if self.busy {
+            if ui
+                .add_sized([ui.available_width(), 42.0], egui::Button::new("取消当前任务"))
+                .clicked()
+            {
+                self.cancel_current_task();
+            }
+        } else {
+            let can_run = !self.compress_sources.is_empty() && self.compress_output.is_some();
+            if ui
+                .add_enabled_ui(can_run, |ui| {
+                    ui.add_sized(
+                        [ui.available_width(), 46.0],
+                        theme::primary_action_button("压缩"),
+                    )
+                })
+                .inner
+                .clicked()
+            {
+                self.start_compress();
+            }
         }
     }
 
@@ -1063,6 +1288,7 @@ impl eframe::App for ArchiverApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.handle_drops(ctx);
         self.poll_worker(ctx);
+        self.poll_preview(ctx);
 
         let drag_from_os = ctx.input(|i| !i.raw.hovered_files.is_empty());
 
@@ -1098,7 +1324,7 @@ impl eframe::App for ArchiverApp {
                 });
             });
 
-        if self.busy {
+        if self.busy || self.preview_busy {
             ctx.request_repaint_after(std::time::Duration::from_millis(50));
         }
     }

@@ -3,6 +3,10 @@
 use std::collections::HashSet;
 use std::fs::File;
 use std::path::{Path, PathBuf};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 
 use anyhow::{Context, Result, anyhow};
 use bzip2::Compression as Bzip2Compression;
@@ -110,12 +114,14 @@ impl CompressionLevel {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct CompressOptions {
     pub level: CompressionLevel,
     pub keep_top_level: bool,
     pub include_hidden: bool,
     pub exclude_mac_metadata: bool,
+    pub exclude_common_dev_dirs: bool,
+    pub cancel: Option<Arc<AtomicBool>>,
 }
 
 impl Default for CompressOptions {
@@ -123,10 +129,25 @@ impl Default for CompressOptions {
         Self {
             level: CompressionLevel::Balanced,
             keep_top_level: true,
-            include_hidden: true,
+            include_hidden: false,
             exclude_mac_metadata: true,
+            exclude_common_dev_dirs: true,
+            cancel: None,
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CompressStats {
+    pub file_count: usize,
+    pub total_bytes: u64,
+}
+
+fn check_cancel(cancel: Option<&Arc<AtomicBool>>) -> Result<()> {
+    if cancel.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+        return Err(anyhow!("任务已取消"));
+    }
+    Ok(())
 }
 
 /// 将 `sources` 中的文件与目录（递归）写入 `output`，路径使用 `/`。
@@ -143,17 +164,33 @@ pub fn compress_with_options(
         std::fs::create_dir_all(parent)
             .with_context(|| format!("创建目录 {}", parent.display()))?;
     }
-    let pairs = collect_file_pairs(sources, options)?;
+    check_cancel(options.cancel.as_ref())?;
+    let pairs = collect_file_pairs(sources, &options)?;
     if pairs.is_empty() {
         return Err(anyhow!("没有可压缩的文件（空目录或未选到有效路径）"));
     }
     match format {
-        CompressFormat::Zip => compress_zip(&pairs, output, options.level),
-        CompressFormat::TarGzip => compress_tar_gz(&pairs, output, options.level),
-        CompressFormat::TarBzip2 => compress_tar_bz2(&pairs, output, options.level),
-        CompressFormat::TarXz => compress_tar_xz(&pairs, output, options.level),
-        CompressFormat::TarZstd => compress_tar_zstd(&pairs, output, options.level),
+        CompressFormat::Zip => compress_zip(&pairs, output, options.level, options.cancel.as_ref()),
+        CompressFormat::TarGzip => compress_tar_gz(&pairs, output, options.level, options.cancel.as_ref()),
+        CompressFormat::TarBzip2 => compress_tar_bz2(&pairs, output, options.level, options.cancel.as_ref()),
+        CompressFormat::TarXz => compress_tar_xz(&pairs, output, options.level, options.cancel.as_ref()),
+        CompressFormat::TarZstd => compress_tar_zstd(&pairs, output, options.level, options.cancel.as_ref()),
     }
+}
+
+pub fn estimate_sources(sources: &[PathBuf], options: CompressOptions) -> Result<CompressStats> {
+    let pairs = collect_file_pairs(sources, &options)?;
+    let mut stats = CompressStats {
+        file_count: pairs.len(),
+        total_bytes: 0,
+    };
+    for (disk, _) in pairs {
+        check_cancel(options.cancel.as_ref())?;
+        if let Ok(meta) = std::fs::metadata(&disk) {
+            stats.total_bytes = stats.total_bytes.saturating_add(meta.len());
+        }
+    }
+    Ok(stats)
 }
 
 fn posix_path(s: &str) -> String {
@@ -195,7 +232,7 @@ fn unique_top_level_name(orig: &str, used: &mut HashSet<String>) -> String {
     }
 }
 
-fn should_skip_path(path: &Path, options: CompressOptions) -> bool {
+fn should_skip_path(path: &Path, options: &CompressOptions) -> bool {
     path.components().any(|comp| {
         let Some(name) = comp.as_os_str().to_str() else {
             return false;
@@ -203,15 +240,24 @@ fn should_skip_path(path: &Path, options: CompressOptions) -> bool {
         if options.exclude_mac_metadata && (name == ".DS_Store" || name == "__MACOSX") {
             return true;
         }
+        if options.exclude_common_dev_dirs
+            && matches!(
+                name,
+                ".git" | ".idea" | ".vscode" | "node_modules" | "target" | ".next" | "dist"
+            )
+        {
+            return true;
+        }
         !options.include_hidden && name.starts_with('.')
     })
 }
 
-fn collect_file_pairs(sources: &[PathBuf], options: CompressOptions) -> Result<Vec<(PathBuf, String)>> {
+fn collect_file_pairs(sources: &[PathBuf], options: &CompressOptions) -> Result<Vec<(PathBuf, String)>> {
     let mut out: Vec<(PathBuf, String)> = Vec::new();
     let mut used_top: HashSet<String> = HashSet::new();
 
     for src in sources {
+        check_cancel(options.cancel.as_ref())?;
         let src = src.canonicalize().with_context(|| format!("无效路径: {}", src.display()))?;
         if should_skip_path(&src, options) {
             continue;
@@ -231,6 +277,7 @@ fn collect_file_pairs(sources: &[PathBuf], options: CompressOptions) -> Result<V
                 .and_then(|n| n.to_str())
                 .ok_or_else(|| anyhow!("文件夹名需为 UTF-8: {}", src.display()))?;
             for entry in WalkDir::new(&src).follow_links(false).into_iter() {
+                check_cancel(options.cancel.as_ref())?;
                 let entry = entry.with_context(|| format!("遍历 {}", src.display()))?;
                 if entry.file_type().is_symlink() {
                     continue;
@@ -262,7 +309,12 @@ fn collect_file_pairs(sources: &[PathBuf], options: CompressOptions) -> Result<V
     Ok(out)
 }
 
-fn compress_zip(pairs: &[(PathBuf, String)], output: &Path, level: CompressionLevel) -> Result<()> {
+fn compress_zip(
+    pairs: &[(PathBuf, String)],
+    output: &Path,
+    level: CompressionLevel,
+    cancel: Option<&Arc<AtomicBool>>,
+) -> Result<()> {
     let file = File::create(output).with_context(|| format!("创建 {}", output.display()))?;
     let mut zip = ZipWriter::new(file);
     let opts = SimpleFileOptions::default()
@@ -270,6 +322,7 @@ fn compress_zip(pairs: &[(PathBuf, String)], output: &Path, level: CompressionLe
         .compression_level(Some(level.zip_level()));
 
     for (disk, name) in pairs {
+        check_cancel(cancel)?;
         zip.start_file(name, opts)
             .with_context(|| format!("zip 条目 {name}"))?;
         let mut f = File::open(disk).with_context(|| format!("打开 {}", disk.display()))?;
@@ -279,11 +332,17 @@ fn compress_zip(pairs: &[(PathBuf, String)], output: &Path, level: CompressionLe
     Ok(())
 }
 
-fn compress_tar_gz(pairs: &[(PathBuf, String)], output: &Path, level: CompressionLevel) -> Result<()> {
+fn compress_tar_gz(
+    pairs: &[(PathBuf, String)],
+    output: &Path,
+    level: CompressionLevel,
+    cancel: Option<&Arc<AtomicBool>>,
+) -> Result<()> {
     let file = File::create(output).with_context(|| format!("创建 {}", output.display()))?;
     let enc = GzEncoder::new(file, level.gzip_level());
     let mut builder = Builder::new(enc);
     for (disk, name) in pairs {
+        check_cancel(cancel)?;
         builder
             .append_path_with_name(disk, name)
             .with_context(|| format!("tar 条目 {}", name))?;
@@ -293,11 +352,17 @@ fn compress_tar_gz(pairs: &[(PathBuf, String)], output: &Path, level: Compressio
     Ok(())
 }
 
-fn compress_tar_bz2(pairs: &[(PathBuf, String)], output: &Path, level: CompressionLevel) -> Result<()> {
+fn compress_tar_bz2(
+    pairs: &[(PathBuf, String)],
+    output: &Path,
+    level: CompressionLevel,
+    cancel: Option<&Arc<AtomicBool>>,
+) -> Result<()> {
     let file = File::create(output).with_context(|| format!("创建 {}", output.display()))?;
     let enc = bzip2::write::BzEncoder::new(file, level.bzip2_level());
     let mut builder = Builder::new(enc);
     for (disk, name) in pairs {
+        check_cancel(cancel)?;
         builder
             .append_path_with_name(disk, name)
             .with_context(|| format!("tar 条目 {}", name))?;
@@ -307,11 +372,17 @@ fn compress_tar_bz2(pairs: &[(PathBuf, String)], output: &Path, level: Compressi
     Ok(())
 }
 
-fn compress_tar_xz(pairs: &[(PathBuf, String)], output: &Path, level: CompressionLevel) -> Result<()> {
+fn compress_tar_xz(
+    pairs: &[(PathBuf, String)],
+    output: &Path,
+    level: CompressionLevel,
+    cancel: Option<&Arc<AtomicBool>>,
+) -> Result<()> {
     let file = File::create(output).with_context(|| format!("创建 {}", output.display()))?;
     let enc = xz2::write::XzEncoder::new(file, level.xz_level());
     let mut builder = Builder::new(enc);
     for (disk, name) in pairs {
+        check_cancel(cancel)?;
         builder
             .append_path_with_name(disk, name)
             .with_context(|| format!("tar 条目 {}", name))?;
@@ -321,12 +392,18 @@ fn compress_tar_xz(pairs: &[(PathBuf, String)], output: &Path, level: Compressio
     Ok(())
 }
 
-fn compress_tar_zstd(pairs: &[(PathBuf, String)], output: &Path, level: CompressionLevel) -> Result<()> {
+fn compress_tar_zstd(
+    pairs: &[(PathBuf, String)],
+    output: &Path,
+    level: CompressionLevel,
+    cancel: Option<&Arc<AtomicBool>>,
+) -> Result<()> {
     let file = File::create(output).with_context(|| format!("创建 {}", output.display()))?;
     let enc = zstd::stream::write::Encoder::new(file, level.zstd_level())
         .context("创建 zstd 编码器")?;
     let mut builder = Builder::new(enc);
     for (disk, name) in pairs {
+        check_cancel(cancel)?;
         builder
             .append_path_with_name(disk, name)
             .with_context(|| format!("tar 条目 {}", name))?;

@@ -3,6 +3,10 @@
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Component, Path, PathBuf};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 
 use anyhow::{anyhow, Context, Result};
 use flate2::read::GzDecoder;
@@ -84,6 +88,7 @@ impl Default for OverwritePolicy {
 pub struct ExtractOptions {
     pub overwrite: OverwritePolicy,
     pub password: Option<String>,
+    pub cancel: Option<Arc<AtomicBool>>,
 }
 
 #[derive(Clone, Debug)]
@@ -99,6 +104,13 @@ pub struct ArchiveEntryPreview {
     pub size: Option<u64>,
     pub is_dir: bool,
     pub encrypted: bool,
+}
+
+fn check_cancel(cancel: Option<&Arc<AtomicBool>>) -> Result<()> {
+    if cancel.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+        return Err(anyhow!("任务已取消"));
+    }
+    Ok(())
 }
 
 /// 将 `member` 安全地拼到 `base` 下，拒绝绝对路径与 `..`。
@@ -135,6 +147,7 @@ pub fn extract_with_options(
 ) -> Result<()> {
     std::fs::create_dir_all(out_dir)
         .with_context(|| format!("无法创建输出目录: {}", out_dir.display()))?;
+    check_cancel(options.cancel.as_ref())?;
     match kind {
         ArchiveKind::Zip => extract_zip(archive, out_dir, options, &mut on_progress),
         ArchiveKind::SevenZ => extract_7z(archive, out_dir, options, &mut on_progress),
@@ -211,6 +224,7 @@ fn extract_zip(
     let mut archive = ZipArchive::new(file).context("读取 ZIP 失败")?;
     let total = archive.len();
     for i in 0..total {
+        check_cancel(options.cancel.as_ref())?;
         let mut entry = {
             let probe = archive.by_index(i).with_context(|| format!("ZIP 条目 {i}"))?;
             let encrypted = probe.encrypted();
@@ -267,6 +281,7 @@ fn extract_tar<R: Read>(
     let mut archive = Archive::new(reader);
     let mut current = 0usize;
     for entry in archive.entries().context("读取 TAR 条目失败")? {
+        check_cancel(options.cancel.as_ref())?;
         let mut entry = entry.context("读取 TAR 条目失败")?;
         let path = entry.path().context("读取 TAR 条目路径失败")?;
         let name = path.to_string_lossy().replace('\\', "/");
@@ -317,6 +332,8 @@ fn extract_7z(
         out,
         password,
         |entry, reader, _dest| {
+            check_cancel(options.cancel.as_ref())
+                .map_err(|e| sevenz_rust::Error::other(e.to_string()))?;
             let name = entry.name().to_string();
             current += 1;
             on_progress(ExtractProgress {
@@ -370,6 +387,7 @@ fn extract_rar(
         .read_header()
         .map_err(|e| anyhow!("读取 RAR 条目失败: {e}"))?
     {
+        check_cancel(options.cancel.as_ref())?;
         current += 1;
         let name = header.entry().filename.to_string_lossy().replace('\\', "/");
         on_progress(ExtractProgress {
