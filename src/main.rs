@@ -277,6 +277,27 @@ impl ArchiverApp {
         }
     }
 
+    fn prepare_worker_task(
+        &mut self,
+        initial_log: impl AsRef<str>,
+        cancel_flag: Arc<AtomicBool>,
+    ) -> Sender<WorkerMsg> {
+        self.busy = true;
+        self.log.clear();
+        self.last_output = None;
+        self.last_outputs.clear();
+        self.progress_current = 0;
+        self.progress_total = None;
+        self.progress_file.clear();
+        self.cancel_flag = Some(cancel_flag);
+        self.append_log(initial_log);
+
+        let (tx, rx) = mpsc::channel();
+        self.worker_rx = Some(rx);
+        self._worker_tx = Some(tx.clone());
+        tx
+    }
+
     fn start_extract(&mut self) {
         if self.archive_paths.is_empty() {
             self.append_log("请先选择压缩包。");
@@ -291,21 +312,11 @@ impl ArchiverApp {
             Some(self.password.clone())
         };
         let batch = archives.len() > 1;
-
-        self.busy = true;
-        self.log.clear();
-        self.last_output = None;
-        self.last_outputs.clear();
-        self.progress_current = 0;
-        self.progress_total = None;
-        self.progress_file.clear();
-        self.append_log(format!("开始解压 {} 个压缩包。", archives.len()));
         let cancel_flag = Arc::new(AtomicBool::new(false));
-        self.cancel_flag = Some(cancel_flag.clone());
-
-        let (tx, rx) = mpsc::channel();
-        self.worker_rx = Some(rx);
-        self._worker_tx = Some(tx.clone());
+        let tx = self.prepare_worker_task(
+            format!("开始解压 {} 个压缩包。", archives.len()),
+            cancel_flag.clone(),
+        );
 
         std::thread::spawn(move || {
             let mut outputs = Vec::new();
@@ -384,23 +395,10 @@ impl ArchiverApp {
             exclude_common_dev_dirs: self.compress_exclude_common_dev_dirs,
             cancel: Some(cancel_flag.clone()),
         };
-        self.busy = true;
-        self.log.clear();
-        self.last_output = None;
-        self.last_outputs.clear();
-        self.progress_current = 0;
-        self.progress_total = None;
-        self.progress_file.clear();
-        self.cancel_flag = Some(cancel_flag);
-        self.append_log(format!(
-            "压缩 {} → {}",
-            fmt.label(),
-            out.display()
-        ));
-
-        let (tx, rx) = mpsc::channel();
-        self.worker_rx = Some(rx);
-        self._worker_tx = Some(tx.clone());
+        let tx = self.prepare_worker_task(
+            format!("压缩 {} → {}", fmt.label(), out.display()),
+            cancel_flag,
+        );
 
         std::thread::spawn(move || {
             let res = compress_with_options(&sources, &out, fmt, options)

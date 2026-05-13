@@ -126,6 +126,7 @@ dependencies = [
  "rfd",
  "sevenz-rust",
  "tar",
+ "tempfile",
  "unrar",
  "walkdir",
  "xz2",

@@ -2,6 +2,7 @@
 
 use std::collections::HashSet;
 use std::fs::File;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{
     Arc,
@@ -150,6 +151,24 @@ fn check_cancel(cancel: Option<&Arc<AtomicBool>>) -> Result<()> {
     Ok(())
 }
 
+fn copy_with_cancel<R: Read, W: Write>(
+    reader: &mut R,
+    writer: &mut W,
+    cancel: Option<&Arc<AtomicBool>>,
+) -> Result<u64> {
+    let mut buf = [0_u8; 64 * 1024];
+    let mut written = 0_u64;
+    loop {
+        check_cancel(cancel)?;
+        let n = reader.read(&mut buf).context("读取数据失败")?;
+        if n == 0 {
+            return Ok(written);
+        }
+        writer.write_all(&buf[..n]).context("写入数据失败")?;
+        written += n as u64;
+    }
+}
+
 /// 将 `sources` 中的文件与目录（递归）写入 `output`，路径使用 `/`。
 pub fn compress_with_options(
     sources: &[PathBuf],
@@ -232,23 +251,27 @@ fn unique_top_level_name(orig: &str, used: &mut HashSet<String>) -> String {
     }
 }
 
+fn should_skip_name(name: &str, options: &CompressOptions) -> bool {
+    if options.exclude_mac_metadata && (name == ".DS_Store" || name == "__MACOSX") {
+        return true;
+    }
+    if options.exclude_common_dev_dirs
+        && matches!(
+            name,
+            ".git" | ".idea" | ".vscode" | "node_modules" | "target" | ".next" | "dist"
+        )
+    {
+        return true;
+    }
+    !options.include_hidden && name.starts_with('.')
+}
+
 fn should_skip_path(path: &Path, options: &CompressOptions) -> bool {
     path.components().any(|comp| {
         let Some(name) = comp.as_os_str().to_str() else {
             return false;
         };
-        if options.exclude_mac_metadata && (name == ".DS_Store" || name == "__MACOSX") {
-            return true;
-        }
-        if options.exclude_common_dev_dirs
-            && matches!(
-                name,
-                ".git" | ".idea" | ".vscode" | "node_modules" | "target" | ".next" | "dist"
-            )
-        {
-            return true;
-        }
-        !options.include_hidden && name.starts_with('.')
+        should_skip_name(name, options)
     })
 }
 
@@ -259,7 +282,11 @@ fn collect_file_pairs(sources: &[PathBuf], options: &CompressOptions) -> Result<
     for src in sources {
         check_cancel(options.cancel.as_ref())?;
         let src = src.canonicalize().with_context(|| format!("无效路径: {}", src.display()))?;
-        if should_skip_path(&src, options) {
+        if src
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| should_skip_name(name, options))
+        {
             continue;
         }
         if src.is_file() {
@@ -284,12 +311,12 @@ fn collect_file_pairs(sources: &[PathBuf], options: &CompressOptions) -> Result<
                 }
                 let path = entry.path();
                 if path.is_file() {
-                    if should_skip_path(path, options) {
-                        continue;
-                    }
                     let rel = path
                         .strip_prefix(&src)
                         .with_context(|| format!("路径前缀: {}", path.display()))?;
+                    if should_skip_path(rel, options) {
+                        continue;
+                    }
                     let inner = rel.to_string_lossy();
                     if inner.is_empty() {
                         continue;
@@ -326,7 +353,8 @@ fn compress_zip(
         zip.start_file(name, opts)
             .with_context(|| format!("zip 条目 {name}"))?;
         let mut f = File::open(disk).with_context(|| format!("打开 {}", disk.display()))?;
-        std::io::copy(&mut f, &mut zip).with_context(|| format!("写入 zip {name}"))?;
+        copy_with_cancel(&mut f, &mut zip, cancel)
+            .with_context(|| format!("写入 zip {name}"))?;
     }
     zip.finish().context("完成 ZIP 写入")?;
     Ok(())
@@ -411,4 +439,72 @@ fn compress_tar_zstd(
     let enc = builder.into_inner().context("结束 tar 打包")?;
     enc.finish().context("结束 zstd")?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use zip::ZipArchive;
+
+    #[test]
+    fn estimate_sources_respects_default_exclusions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("input");
+        std::fs::create_dir_all(root.join("node_modules")).unwrap();
+        std::fs::write(root.join("visible.txt"), b"hello").unwrap();
+        std::fs::write(root.join(".hidden"), b"secret").unwrap();
+        std::fs::write(root.join(".DS_Store"), b"mac").unwrap();
+        std::fs::write(root.join("node_modules/pkg.js"), b"pkg").unwrap();
+
+        let stats = estimate_sources(&[root], CompressOptions::default()).unwrap();
+
+        assert_eq!(stats.file_count, 1);
+        assert_eq!(stats.total_bytes, 5);
+    }
+
+    #[test]
+    fn zip_output_excludes_hidden_mac_metadata_and_dev_dirs_by_default() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("input");
+        std::fs::create_dir_all(root.join("target")).unwrap();
+        std::fs::write(root.join("visible.txt"), b"hello").unwrap();
+        std::fs::write(root.join(".hidden"), b"secret").unwrap();
+        std::fs::write(root.join(".DS_Store"), b"mac").unwrap();
+        std::fs::write(root.join("target/build.bin"), b"build").unwrap();
+
+        let out = tmp.path().join("archive.zip");
+        compress_with_options(
+            &[root],
+            &out,
+            CompressFormat::Zip,
+            CompressOptions::default(),
+        )
+        .unwrap();
+
+        let file = File::open(&out).unwrap();
+        let mut archive = ZipArchive::new(file).unwrap();
+        let mut names = Vec::new();
+        for i in 0..archive.len() {
+            names.push(archive.by_index(i).unwrap().name().to_string());
+        }
+
+        assert_eq!(names, vec!["input/visible.txt"]);
+    }
+
+    #[test]
+    fn cancelled_estimate_stops_before_work() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("input");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("visible.txt"), b"hello").unwrap();
+
+        let cancel = Arc::new(AtomicBool::new(true));
+        let options = CompressOptions {
+            cancel: Some(cancel),
+            ..CompressOptions::default()
+        };
+
+        let err = estimate_sources(&[root], options).unwrap_err().to_string();
+        assert!(err.contains("任务已取消"));
+    }
 }

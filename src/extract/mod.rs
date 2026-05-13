@@ -1,7 +1,7 @@
 //! 将常见压缩包解压到目标目录，并做路径穿越防护。
 
 use std::fs::File;
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::{
     Arc,
@@ -111,6 +111,24 @@ fn check_cancel(cancel: Option<&Arc<AtomicBool>>) -> Result<()> {
         return Err(anyhow!("任务已取消"));
     }
     Ok(())
+}
+
+fn copy_with_cancel<R: Read + ?Sized, W: Write>(
+    reader: &mut R,
+    writer: &mut W,
+    cancel: Option<&Arc<AtomicBool>>,
+) -> Result<u64> {
+    let mut buf = [0_u8; 64 * 1024];
+    let mut written = 0_u64;
+    loop {
+        check_cancel(cancel)?;
+        let n = reader.read(&mut buf).context("读取数据失败")?;
+        if n == 0 {
+            return Ok(written);
+        }
+        writer.write_all(&buf[..n]).context("写入数据失败")?;
+        written += n as u64;
+    }
 }
 
 /// 将 `member` 安全地拼到 `base` 下，拒绝绝对路径与 `..`。
@@ -267,7 +285,8 @@ fn extract_zip(
             std::fs::create_dir_all(p)?;
         }
         let mut outfile = File::create(&outpath).with_context(|| format!("创建文件 {}", outpath.display()))?;
-        std::io::copy(&mut entry, &mut outfile).with_context(|| format!("写入 {}", outpath.display()))?;
+        copy_with_cancel(&mut entry, &mut outfile, options.cancel.as_ref())
+            .with_context(|| format!("写入 {}", outpath.display()))?;
     }
     Ok(())
 }
@@ -307,8 +326,9 @@ fn extract_tar<R: Read>(
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("创建目录 {}", parent.display()))?;
         }
-        entry
-            .unpack(&outpath)
+        let mut outfile =
+            File::create(&outpath).with_context(|| format!("创建文件 {}", outpath.display()))?;
+        copy_with_cancel(&mut entry, &mut outfile, options.cancel.as_ref())
             .with_context(|| format!("解压 TAR 条目 {}", outpath.display()))?;
     }
     Ok(())
@@ -358,7 +378,8 @@ fn extract_7z(
                     sevenz_rust::Error::io_msg(e, format!("打开 {}", dest.display()))
                 })?,
             );
-            std::io::copy(reader, &mut writer).map_err(sevenz_rust::Error::io)?;
+            copy_with_cancel(reader, &mut writer, options.cancel.as_ref())
+                .map_err(|e| sevenz_rust::Error::other(e.to_string()))?;
             Ok(true)
         },
     )
@@ -531,4 +552,68 @@ fn list_7z(path: &Path, password: Option<&str>) -> Result<Vec<ArchiveEntryPrevie
             encrypted: false,
         })
         .collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+    use tempfile::tempdir;
+
+    #[test]
+    fn safe_join_rejects_parent_and_absolute_paths() {
+        let dir = tempdir().unwrap();
+
+        assert!(safe_join(dir.path(), "../evil.txt").is_err());
+        assert!(safe_join(dir.path(), "/tmp/evil.txt").is_err());
+        assert!(safe_join(dir.path(), "nested/file.txt").is_ok());
+    }
+
+    #[test]
+    fn resolve_conflict_renames_existing_file() {
+        let dir = tempdir().unwrap();
+        let existing = dir.path().join("file.txt");
+        std::fs::write(&existing, b"old").unwrap();
+
+        let renamed = resolve_conflict(&existing, OverwritePolicy::Rename).unwrap();
+
+        assert_eq!(renamed.file_name().unwrap(), "file 2.txt");
+        assert_eq!(resolve_conflict(&existing, OverwritePolicy::Skip), None);
+        assert_eq!(
+            resolve_conflict(&existing, OverwritePolicy::Overwrite),
+            Some(existing)
+        );
+    }
+
+    #[test]
+    fn copy_with_cancel_stops_between_chunks() {
+        struct CancelAfterFirstRead {
+            data: Cursor<Vec<u8>>,
+            cancel: Arc<AtomicBool>,
+            reads: usize,
+        }
+
+        impl Read for CancelAfterFirstRead {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                self.reads += 1;
+                if self.reads > 1 {
+                    self.cancel.store(true, Ordering::Relaxed);
+                }
+                self.data.read(buf)
+            }
+        }
+
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut reader = CancelAfterFirstRead {
+            data: Cursor::new(vec![1_u8; 192 * 1024]),
+            cancel: cancel.clone(),
+            reads: 0,
+        };
+        let mut output = Vec::new();
+
+        let err = copy_with_cancel(&mut reader, &mut output, Some(&cancel)).unwrap_err();
+
+        assert!(err.to_string().contains("任务已取消"));
+        assert!(output.len() < 192 * 1024);
+    }
 }
