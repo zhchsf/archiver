@@ -171,30 +171,79 @@ pub fn extract_with_options(
         ArchiveKind::SevenZ => extract_7z(archive, out_dir, options, &mut on_progress),
         ArchiveKind::Rar => extract_rar(archive, out_dir, options, &mut on_progress),
         ArchiveKind::TarPlain => {
+            // 未压缩 tar：可额外扫一遍条目数，进度条显示 n/total，成本可接受。
+            let total = count_tar_entries_plain(archive, options.cancel.as_ref()).ok();
             let f = File::open(archive)?;
-            extract_tar(f, out_dir, options, &mut on_progress)
+            extract_tar(f, out_dir, options, total, &mut on_progress)
         }
         ArchiveKind::TarGzip => {
             let f = File::open(archive)?;
-            extract_tar(GzDecoder::new(f), out_dir, options, &mut on_progress)
+            extract_tar(GzDecoder::new(f), out_dir, options, None, &mut on_progress)
         }
         ArchiveKind::TarBzip2 => {
             let f = File::open(archive)?;
             let dec = bzip2::read::BzDecoder::new(f);
-            extract_tar(dec, out_dir, options, &mut on_progress)
+            extract_tar(dec, out_dir, options, None, &mut on_progress)
         }
         ArchiveKind::TarXz => {
             let f = File::open(archive)?;
             let dec = xz2::read::XzDecoder::new(f);
-            extract_tar(dec, out_dir, options, &mut on_progress)
+            extract_tar(dec, out_dir, options, None, &mut on_progress)
         }
         ArchiveKind::TarZstd => {
             let f = File::open(archive)?;
             let dec = zstd::stream::read::Decoder::new(f)
                 .context("打开 zstd 流失败")?;
-            extract_tar(dec, out_dir, options, &mut on_progress)
+            extract_tar(dec, out_dir, options, None, &mut on_progress)
         }
     }
+}
+
+/// 仅用于 `.tar`：统计条目数（不解压正文），便于进度条显示总数。
+fn count_tar_entries_plain(path: &Path, cancel: Option<&Arc<AtomicBool>>) -> Result<usize> {
+    let f = File::open(path)?;
+    let mut archive = Archive::new(f);
+    let mut n = 0usize;
+    for entry in archive.entries().context("读取 TAR 条目失败")? {
+        check_cancel(cancel)?;
+        let _ = entry.context("读取 TAR 条目失败")?;
+        n += 1;
+    }
+    Ok(n)
+}
+
+fn sevenz_entry_count(path: &Path, password: &sevenz_rust::Password) -> Result<usize> {
+    let mut file = File::open(path).with_context(|| format!("打开 {}", path.display()))?;
+    let len = file
+        .seek(SeekFrom::End(0))
+        .context("读取 7z 大小失败")?;
+    file.seek(SeekFrom::Start(0)).context("读取 7z 失败")?;
+    let reader = sevenz_rust::SevenZReader::new(file, len, password.clone())
+        .map_err(|e| anyhow!("读取 7z 目录失败: {e}"))?;
+    Ok(reader.archive().files.len())
+}
+
+fn rar_entry_count(path: &Path, password: Option<&str>) -> Result<usize> {
+    let rar = if let Some(password) = password {
+        RarArchive::with_password(path, password)
+    } else {
+        RarArchive::new(path)
+    };
+    let mut archive = rar
+        .as_first_part()
+        .open_for_listing()
+        .map_err(|e| anyhow!("打开 RAR 失败: {e}"))?;
+    let mut n = 0usize;
+    while let Some(header) = archive
+        .read_header()
+        .map_err(|e| anyhow!("读取 RAR 条目失败: {e}"))?
+    {
+        n += 1;
+        archive = header
+            .skip()
+            .map_err(|e| anyhow!("跳过 RAR 条目失败: {e}"))?;
+    }
+    Ok(n)
 }
 
 fn next_available_path(path: &Path) -> PathBuf {
@@ -295,6 +344,7 @@ fn extract_tar<R: Read>(
     reader: R,
     out: &Path,
     options: ExtractOptions,
+    total_entries: Option<usize>,
     on_progress: &mut impl FnMut(ExtractProgress),
 ) -> Result<()> {
     let mut archive = Archive::new(reader);
@@ -307,7 +357,7 @@ fn extract_tar<R: Read>(
         current += 1;
         on_progress(ExtractProgress {
             current,
-            total: None,
+            total: total_entries,
             file: name.clone(),
         });
         let outpath = safe_join(out, &name)?;
@@ -346,6 +396,7 @@ fn extract_7z(
         .as_deref()
         .map(sevenz_rust::Password::from)
         .unwrap_or_else(sevenz_rust::Password::empty);
+    let total = sevenz_entry_count(path, &password).ok();
     let mut current = 0usize;
     sevenz_rust::decompress_with_extract_fn_and_password(
         file,
@@ -358,7 +409,7 @@ fn extract_7z(
             current += 1;
             on_progress(ExtractProgress {
                 current,
-                total: None,
+                total,
                 file: name,
             });
             let safe_dest = safe_join(out, entry.name())
@@ -394,6 +445,7 @@ fn extract_rar(
     options: ExtractOptions,
     on_progress: &mut impl FnMut(ExtractProgress),
 ) -> Result<()> {
+    let total = rar_entry_count(archive, options.password.as_deref()).ok();
     let rar = if let Some(password) = options.password.as_deref() {
         RarArchive::with_password(archive, password)
     } else {
@@ -413,7 +465,7 @@ fn extract_rar(
         let name = header.entry().filename.to_string_lossy().replace('\\', "/");
         on_progress(ExtractProgress {
             current,
-            total: None,
+            total,
             file: name.clone(),
         });
         archive = if header.entry().is_file() {

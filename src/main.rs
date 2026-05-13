@@ -22,6 +22,31 @@ use extract::{
     extract_with_options, list_archive,
 };
 
+/// 仅保留末尾 `max_lines` 个以 `\n` 分隔的片段（含末尾换行习惯），避免 `lines().collect()` 整表分配。
+fn trim_log_to_last_n_lines(log: &mut String, max_lines: usize) {
+    if max_lines == 0 {
+        log.clear();
+        return;
+    }
+    let n = log.as_bytes().iter().filter(|&&b| b == b'\n').count();
+    if n <= max_lines {
+        return;
+    }
+    let drop = n - max_lines;
+    let mut passed = 0usize;
+    let mut cut_at = 0usize;
+    for (i, ch) in log.char_indices() {
+        if ch == '\n' {
+            passed += 1;
+            if passed == drop {
+                cut_at = i.saturating_add(1);
+                break;
+            }
+        }
+    }
+    log.drain(..cut_at);
+}
+
 fn main() -> eframe::Result<()> {
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -72,6 +97,7 @@ struct ArchiverApp {
     preview_entries: Vec<ArchiveEntryPreview>,
     preview_status: String,
     preview_busy: bool,
+    preview_filter: String,
     preview_rx: Option<Receiver<PreviewMsg>>,
     _preview_tx: Option<Sender<PreviewMsg>>,
     last_output: Option<PathBuf>,
@@ -108,6 +134,7 @@ impl ArchiverApp {
             preview_entries: Vec::new(),
             preview_status: String::new(),
             preview_busy: false,
+            preview_filter: String::new(),
             preview_rx: None,
             _preview_tx: None,
             last_output: None,
@@ -133,8 +160,10 @@ impl ArchiverApp {
     }
 
     fn append_log(&mut self, line: impl AsRef<str>) {
+        const MAX_LOG_LINES: usize = 400;
         self.log.push_str(line.as_ref());
         self.log.push('\n');
+        trim_log_to_last_n_lines(&mut self.log, MAX_LOG_LINES);
     }
 
     fn pick_archive(&mut self) {
@@ -154,6 +183,7 @@ impl ArchiverApp {
             }
             self.preview_entries.clear();
             self.preview_status.clear();
+            self.preview_filter.clear();
             self.log.clear();
         }
     }
@@ -242,13 +272,17 @@ impl ArchiverApp {
         }
     }
 
+    fn invalidate_compress_estimate(&mut self) {
+        self.compress_stats = None;
+        self.compress_stats_status.clear();
+    }
+
     fn add_compress_source(&mut self, p: PathBuf) {
         if self.compress_sources_has(&p) {
             return;
         }
         self.compress_sources.push(p);
-        self.compress_stats = None;
-        self.compress_stats_status.clear();
+        self.invalidate_compress_estimate();
     }
 
     fn pick_compress_file(&mut self) {
@@ -478,6 +512,7 @@ impl ArchiverApp {
                 }
                 Err(e) => {
                     self.preview_entries.clear();
+                    self.preview_filter.clear();
                     self.preview_status = format!("预览失败: {}", Self::friendly_error(&e));
                 }
             }
@@ -498,6 +533,19 @@ impl ArchiverApp {
         }
         if error.contains("任务已取消") || lower.contains("cancel") {
             return "任务已取消。".to_string();
+        }
+        if lower.contains("no such file")
+            || lower.contains("not found")
+            || lower.contains("oserror 2")
+            || error.contains("找不到")
+        {
+            return "找不到指定文件或目录，请检查路径是否存在。".to_string();
+        }
+        if lower.contains("file name too long") || lower.contains("name too long") {
+            return "路径过长，请缩短文件名或把输出放到更浅层目录。".to_string();
+        }
+        if lower.contains("oserror 28") || lower.contains("no space left on device") {
+            return "磁盘空间不足，请清理空间后重试。".to_string();
         }
         if lower.contains("invalid") || error.contains("损坏") || error.contains("读取") {
             return "压缩包可能已损坏，或格式与扩展名不匹配。".to_string();
@@ -521,6 +569,7 @@ impl ArchiverApp {
         };
         self.preview_busy = true;
         self.preview_entries.clear();
+        self.preview_filter.clear();
         self.preview_status = "正在读取目录…".to_string();
         let (tx, rx) = mpsc::channel();
         self.preview_rx = Some(rx);
@@ -625,6 +674,7 @@ impl ArchiverApp {
                                 self.add_archive_path(path.clone());
                                 self.preview_entries.clear();
                                 self.preview_status.clear();
+                                self.preview_filter.clear();
                                 self.log.clear();
                             }
                         }
@@ -820,12 +870,61 @@ impl ArchiverApp {
                 }
             });
             if !self.preview_entries.is_empty() {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("筛选").size(12.0).color(theme::text_muted()));
+                    ui.add_sized(
+                        [ui.available_width(), 28.0],
+                        egui::TextEdit::singleline(&mut self.preview_filter)
+                            .id(egui::Id::new("preview_filter"))
+                            .hint_text("关键词…"),
+                    );
+                });
+                let q = self.preview_filter.trim().to_lowercase();
+                let (filtered, more_matches) = if q.is_empty() {
+                    (
+                        self.preview_entries.iter().take(80).collect::<Vec<_>>(),
+                        false,
+                    )
+                } else {
+                    let mut out = Vec::new();
+                    let mut more_matches = false;
+                    for e in &self.preview_entries {
+                        if !e.name.to_lowercase().contains(&q) {
+                            continue;
+                        }
+                        if out.len() < 200 {
+                            out.push(e);
+                        } else {
+                            more_matches = true;
+                            break;
+                        }
+                    }
+                    (out, more_matches)
+                };
+                if !q.is_empty() {
+                    ui.label(
+                        RichText::new(format!(
+                            "显示 {} / 共 {} 个条目",
+                            filtered.len(),
+                            self.preview_entries.len()
+                        ))
+                        .size(11.0)
+                        .color(theme::text_muted()),
+                    );
+                }
+                if more_matches {
+                    ui.label(
+                        RichText::new("匹配结果较多，仅显示前 200 条，请缩小关键词。")
+                            .size(11.0)
+                            .color(theme::text_muted()),
+                    );
+                }
                 egui::ScrollArea::vertical()
                     .max_height(130.0)
                     .auto_shrink([false, true])
                     .show(ui, |ui| {
                         ui.spacing_mut().item_spacing.y = 7.0;
-                        for entry in self.preview_entries.iter().take(80) {
+                        for entry in &filtered {
                             let suffix = if entry.is_dir {
                                 "目录".to_string()
                             } else {
@@ -842,7 +941,7 @@ impl ArchiverApp {
                                     .color(theme::INK),
                             );
                         }
-                        if self.preview_entries.len() > 80 {
+                        if q.is_empty() && self.preview_entries.len() > 80 {
                             ui.label(
                                 RichText::new(format!(
                                     "另有 {} 个条目未显示",
@@ -983,8 +1082,7 @@ impl ArchiverApp {
                         .clicked()
                     {
                         self.compress_sources.clear();
-                        self.compress_stats = None;
-                        self.compress_stats_status.clear();
+                        self.invalidate_compress_estimate();
                     }
                 });
             });
@@ -1046,8 +1144,7 @@ impl ArchiverApp {
                         }
                         if let Some(i) = remove_idx {
                             self.compress_sources.remove(i);
-                            self.compress_stats = None;
-                            self.compress_stats_status.clear();
+                            self.invalidate_compress_estimate();
                         }
                     }
                 });
@@ -1139,13 +1236,30 @@ impl ArchiverApp {
                 ui.radio_value(&mut self.compress_level, CompressionLevel::Balanced, "均衡");
                 ui.radio_value(&mut self.compress_level, CompressionLevel::Best, "最高");
             });
-            ui.checkbox(&mut self.compress_keep_top_level, "保留文件夹顶层目录");
-            ui.checkbox(&mut self.compress_include_hidden, "包含隐藏文件");
-            ui.checkbox(&mut self.compress_exclude_mac_metadata, "排除 .DS_Store / __MACOSX");
-            ui.checkbox(
-                &mut self.compress_exclude_common_dev_dirs,
-                "排除常见开发目录（.git / target / node_modules 等）",
-            );
+            if ui
+                .checkbox(&mut self.compress_keep_top_level, "保留文件夹顶层目录")
+                .changed()
+            {
+                self.invalidate_compress_estimate();
+            }
+            if ui.checkbox(&mut self.compress_include_hidden, "包含隐藏文件").changed() {
+                self.invalidate_compress_estimate();
+            }
+            if ui
+                .checkbox(&mut self.compress_exclude_mac_metadata, "排除 .DS_Store / __MACOSX")
+                .changed()
+            {
+                self.invalidate_compress_estimate();
+            }
+            if ui
+                .checkbox(
+                    &mut self.compress_exclude_common_dev_dirs,
+                    "排除常见开发目录（.git / target / node_modules 等）",
+                )
+                .changed()
+            {
+                self.invalidate_compress_estimate();
+            }
         });
 
         if !self.last_outputs.is_empty() {
@@ -1222,7 +1336,11 @@ impl ArchiverApp {
                     );
                 }
             } else if !self.progress_file.is_empty() {
-                ui.add(egui::ProgressBar::new(0.0).animate(true).text("正在处理"));
+                ui.add(
+                    egui::ProgressBar::new(0.0)
+                        .animate(true)
+                        .text("处理中 · 总条目未知（流式包）"),
+                );
             }
             if !self.progress_file.is_empty() {
                 ui.label(
@@ -1243,21 +1361,22 @@ impl ArchiverApp {
                     .max_height(120.0)
                     .stick_to_bottom(true)
                     .show(ui, |ui| {
-                        let body = if self.log.is_empty() {
-                            "暂无记录".to_string()
-                        } else {
-                            self.log.clone()
+                        let log_style = |text: &str| {
+                            RichText::new(text)
+                                .family(egui::FontFamily::Monospace)
+                                .size(12.0)
+                                .line_height(Some(17.0))
+                                .color(theme::INK)
                         };
-                        ui.add(
-                            egui::Label::new(
-                                RichText::new(body)
-                                    .family(egui::FontFamily::Monospace)
-                                    .size(12.0)
-                                    .line_height(Some(17.0))
-                                    .color(theme::INK),
-                            )
-                            .wrap(),
-                        );
+                        if self.log.is_empty() {
+                            ui.add(
+                                egui::Label::new(log_style("暂无记录")).wrap(),
+                            );
+                        } else {
+                            ui.add(
+                                egui::Label::new(log_style(self.log.as_str())).wrap(),
+                            );
+                        }
                     });
             });
 
@@ -1325,5 +1444,31 @@ impl eframe::App for ArchiverApp {
         if self.busy || self.preview_busy {
             ctx.request_repaint_after(std::time::Duration::from_millis(50));
         }
+    }
+}
+
+#[cfg(test)]
+mod log_trim_tests {
+    use super::trim_log_to_last_n_lines;
+
+    #[test]
+    fn trim_log_keeps_last_n_lines() {
+        let mut s = "a\nb\nc\nd\n".to_string();
+        trim_log_to_last_n_lines(&mut s, 2);
+        assert_eq!(s, "c\nd\n");
+    }
+
+    #[test]
+    fn trim_log_noop_when_under_limit() {
+        let mut s = "only\n".to_string();
+        trim_log_to_last_n_lines(&mut s, 400);
+        assert_eq!(s, "only\n");
+    }
+
+    #[test]
+    fn trim_log_unicode_line_boundary() {
+        let mut s = "ascii\n雪\nline3\n".to_string();
+        trim_log_to_last_n_lines(&mut s, 2);
+        assert_eq!(s, "雪\nline3\n");
     }
 }
