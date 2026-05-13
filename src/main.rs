@@ -28,7 +28,12 @@ fn trim_log_to_last_n_lines(log: &mut String, max_lines: usize) {
         log.clear();
         return;
     }
-    let n = log.as_bytes().iter().filter(|&&b| b == b'\n').count();
+    let mut n = 0usize;
+    for &b in log.as_bytes() {
+        if b == b'\n' {
+            n += 1;
+        }
+    }
     if n <= max_lines {
         return;
     }
@@ -45,6 +50,19 @@ fn trim_log_to_last_n_lines(log: &mut String, max_lines: usize) {
         }
     }
     log.drain(..cut_at);
+}
+
+/// `q_lower` 为 `trim().to_lowercase()` 结果。关键词与条目名均为 ASCII 时用字节窗口匹配，避免大包预览时反复分配小写字符串。
+fn preview_name_matches_filter(name: &str, q_lower: &str) -> bool {
+    if q_lower.is_empty() {
+        return true;
+    }
+    if q_lower.is_ascii() && name.is_ascii() {
+        let nb = name.as_bytes();
+        let nl = q_lower.as_bytes();
+        return nb.windows(nl.len()).any(|w| w.eq_ignore_ascii_case(nl));
+    }
+    name.to_lowercase().contains(q_lower)
 }
 
 fn main() -> eframe::Result<()> {
@@ -713,28 +731,38 @@ impl ArchiverApp {
     }
 
     fn render_mode_tabs(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 4.0;
-            let extract = self.mode == AppMode::Extract;
-            let w = (ui.available_width() - 4.0) / 2.0;
-            if ui
-                .add_sized(
-                    [w, 36.0],
-                    egui::SelectableLabel::new(extract, RichText::new("解压").size(15.0).strong()),
-                )
-                .clicked()
-            {
-                self.mode = AppMode::Extract;
-            }
-            if ui
-                .add_sized(
-                    [w, 36.0],
-                    egui::SelectableLabel::new(!extract, RichText::new("压缩").size(15.0).strong()),
-                )
-                .clicked()
-            {
-                self.mode = AppMode::Compress;
-            }
+        theme::mode_tab_bar_frame().show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 6.0;
+                let extract = self.mode == AppMode::Extract;
+                let w = (ui.available_width() - 6.0) / 2.0;
+                if ui
+                    .add_sized(
+                        [w, 38.0],
+                        if extract {
+                            theme::mode_tab_button_selected("解压")
+                        } else {
+                            theme::mode_tab_button_inactive("解压")
+                        },
+                    )
+                    .clicked()
+                {
+                    self.mode = AppMode::Extract;
+                }
+                if ui
+                    .add_sized(
+                        [w, 38.0],
+                        if !extract {
+                            theme::mode_tab_button_selected("压缩")
+                        } else {
+                            theme::mode_tab_button_inactive("压缩")
+                        },
+                    )
+                    .clicked()
+                {
+                    self.mode = AppMode::Compress;
+                }
+            });
         });
     }
 
@@ -746,7 +774,7 @@ impl ArchiverApp {
         let hover = response.hovered() || drag_from_os;
         ui.painter().rect(
             rect,
-            12.0,
+            14.0,
             theme::drop_zone_fill(hover),
             theme::drop_zone_stroke(hover),
         );
@@ -852,7 +880,7 @@ impl ArchiverApp {
                 if ui
                     .add_enabled(
                         can_preview,
-                        egui::Button::new(RichText::new("预览内容").size(13.0)),
+                        theme::outline_secondary_button("预览内容"),
                     )
                     .clicked()
                 {
@@ -889,7 +917,7 @@ impl ArchiverApp {
                     let mut out = Vec::new();
                     let mut more_matches = false;
                     for e in &self.preview_entries {
-                        if !e.name.to_lowercase().contains(&q) {
+                        if !preview_name_matches_filter(&e.name, &q) {
                             continue;
                         }
                         if out.len() < 200 {
@@ -959,18 +987,28 @@ impl ArchiverApp {
             ui.add_space(12.0);
             theme::section_frame().show(ui, |ui| {
                 ui.horizontal_wrapped(|ui| {
+                    ui.spacing_mut().item_spacing = Vec2::new(8.0, 8.0);
                     ui.label(RichText::new("完成后操作").size(12.0).color(theme::text_muted()));
-                    if ui.button("打开输出位置").clicked() {
+                    if ui
+                        .add(theme::subtle_tertiary_button("打开输出位置"))
+                        .clicked()
+                    {
                         if let Some(first) = self.last_outputs.first() {
                             Self::open_in_finder(first);
                         }
                     }
-                    if ui.button("打开父目录").clicked() {
+                    if ui
+                        .add(theme::subtle_tertiary_button("打开父目录"))
+                        .clicked()
+                    {
                         if let Some(parent) = self.last_outputs.first().and_then(|p| p.parent()) {
                             Self::open_in_finder(parent);
                         }
                     }
-                    if ui.button("复制路径").clicked() {
+                    if ui
+                        .add(theme::subtle_tertiary_button("复制路径"))
+                        .clicked()
+                    {
                         ui.ctx().copy_text(
                             self.last_outputs
                                 .iter()
@@ -1003,7 +1041,10 @@ impl ArchiverApp {
 
         if self.busy {
             if ui
-                .add_sized([ui.available_width(), 42.0], egui::Button::new("取消当前任务"))
+                .add_sized(
+                    [ui.available_width(), 42.0],
+                    theme::danger_outline_button("取消当前任务"),
+                )
                 .clicked()
             {
                 self.cancel_current_task();
@@ -1033,7 +1074,7 @@ impl ArchiverApp {
         let hover = response.hovered() || drag_from_os;
         ui.painter().rect(
             rect,
-            12.0,
+            14.0,
             theme::drop_zone_fill(hover),
             theme::drop_zone_stroke(hover),
         );
@@ -1073,14 +1114,7 @@ impl ArchiverApp {
             ui.horizontal(|ui| {
                 ui.label(RichText::new("待压缩内容").size(12.5).strong().color(theme::INK));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui
-                        .small_button(
-                            RichText::new("清空列表")
-                                .size(12.0)
-                                .color(theme::text_muted()),
-                        )
-                        .clicked()
-                    {
+                    if ui.add(theme::small_muted_action("清空列表")).clicked() {
                         self.compress_sources.clear();
                         self.invalidate_compress_estimate();
                     }
@@ -1123,19 +1157,18 @@ impl ArchiverApp {
                                     Sense::click(),
                                 );
                                 let fill = if response.hovered() || response.highlighted() {
-                                    Color32::from_rgb(239, 68, 68)
+                                    theme::REMOVE_FILL_HOVER
                                 } else {
-                                    Color32::from_rgb(220, 38, 38)
+                                    theme::REMOVE_FILL
                                 };
-                                let stroke =
-                                    egui::Stroke::new(1.0, Color32::from_rgb(153, 27, 27));
-                                ui.painter().rect(rect, 6.0, fill, stroke);
+                                let stroke = egui::Stroke::new(1.0, theme::REMOVE_STROKE);
+                                ui.painter().rect(rect, 8.0, fill, stroke);
                                 ui.painter().text(
                                     rect.center(),
                                     Align2::CENTER_CENTER,
                                     "移除",
                                     FontId::proportional(13.0),
-                                    Color32::WHITE,
+                                    theme::REMOVE_LABEL,
                                 );
                                 if response.clicked() {
                                     remove_idx = Some(i);
@@ -1154,15 +1187,15 @@ impl ArchiverApp {
         theme::section_frame().show(ui, |ui| {
             ui.spacing_mut().item_spacing = Vec2::new(12.0, 10.0);
             ui.horizontal_wrapped(|ui| {
-                if ui
-                    .add_enabled(
-                        !self.compress_sources.is_empty() && !self.busy,
-                        egui::Button::new(RichText::new("统计待压缩内容").size(13.0)),
-                    )
-                    .clicked()
-                {
-                    self.refresh_compress_stats();
-                }
+                    if ui
+                        .add_enabled(
+                            !self.compress_sources.is_empty() && !self.busy,
+                            theme::outline_secondary_button("统计待压缩内容"),
+                        )
+                        .clicked()
+                    {
+                        self.refresh_compress_stats();
+                    }
                 let status = if self.compress_stats_status.is_empty() {
                     "压缩前可先统计文件数量和原始大小"
                 } else {
@@ -1192,24 +1225,15 @@ impl ArchiverApp {
             });
         theme::section_frame().show(ui, |ui| {
             ui.spacing_mut().item_spacing = Vec2::new(12.0, 10.0);
-            if ui
-                .add_sized(
-                    [ui.available_width(), 40.0],
-                    egui::Button::new(
-                        RichText::new("选择保存位置…")
-                            .size(14.0)
-                            .color(theme::INK),
-                    )
-                    .fill(egui::Color32::from_rgb(252, 252, 253))
-                    .stroke(egui::Stroke::new(
-                        1.0,
-                        egui::Color32::from_rgb(220, 222, 228),
-                    )),
-                )
-                .clicked()
-            {
-                self.pick_compress_save();
-            }
+                    if ui
+                        .add_sized(
+                            [ui.available_width(), 40.0],
+                            theme::save_destination_button(),
+                        )
+                        .clicked()
+                    {
+                        self.pick_compress_save();
+                    }
             ui.label(RichText::new("输出").size(11.0).color(theme::text_muted()));
             ui.add(
                 egui::Label::new(
@@ -1266,18 +1290,28 @@ impl ArchiverApp {
             ui.add_space(12.0);
             theme::section_frame().show(ui, |ui| {
                 ui.horizontal_wrapped(|ui| {
+                    ui.spacing_mut().item_spacing = Vec2::new(8.0, 8.0);
                     ui.label(RichText::new("完成后操作").size(12.0).color(theme::text_muted()));
-                    if ui.button("打开输出位置").clicked() {
+                    if ui
+                        .add(theme::subtle_tertiary_button("打开输出位置"))
+                        .clicked()
+                    {
                         if let Some(parent) = self.last_outputs.first().and_then(|p| p.parent()) {
                             Self::open_in_finder(parent);
                         }
                     }
-                    if ui.button("在 Finder 中显示").clicked() {
+                    if ui
+                        .add(theme::subtle_tertiary_button("在 Finder 中显示"))
+                        .clicked()
+                    {
                         if let Some(output) = self.last_outputs.first() {
                             Self::reveal_in_finder(output);
                         }
                     }
-                    if ui.button("复制路径").clicked() {
+                    if ui
+                        .add(theme::subtle_tertiary_button("复制路径"))
+                        .clicked()
+                    {
                         ui.ctx().copy_text(
                             self.last_outputs
                                 .iter()
@@ -1294,7 +1328,10 @@ impl ArchiverApp {
 
         if self.busy {
             if ui
-                .add_sized([ui.available_width(), 42.0], egui::Button::new("取消当前任务"))
+                .add_sized(
+                    [ui.available_width(), 42.0],
+                    theme::danger_outline_button("取消当前任务"),
+                )
                 .clicked()
             {
                 self.cancel_current_task();
@@ -1331,6 +1368,7 @@ impl ArchiverApp {
                     let progress = self.progress_current as f32 / total as f32;
                     ui.add(
                         egui::ProgressBar::new(progress.clamp(0.0, 1.0))
+                            .rounding(egui::Rounding::same(6.0))
                             .show_percentage()
                             .text(format!("{}/{}", self.progress_current, total)),
                     );
@@ -1338,6 +1376,7 @@ impl ArchiverApp {
             } else if !self.progress_file.is_empty() {
                 ui.add(
                     egui::ProgressBar::new(0.0)
+                        .rounding(egui::Rounding::same(6.0))
                         .animate(true)
                         .text("处理中 · 总条目未知（流式包）"),
                 );
@@ -1444,6 +1483,24 @@ impl eframe::App for ArchiverApp {
         if self.busy || self.preview_busy {
             ctx.request_repaint_after(std::time::Duration::from_millis(50));
         }
+    }
+}
+
+#[cfg(test)]
+mod preview_filter_tests {
+    use super::preview_name_matches_filter;
+
+    #[test]
+    fn preview_filter_ascii_case_insensitive() {
+        assert!(preview_name_matches_filter("Foo/Bar.txt", "foo"));
+        assert!(preview_name_matches_filter("PATH", "pa"));
+        assert!(!preview_name_matches_filter("abc", "z"));
+    }
+
+    #[test]
+    fn preview_filter_unicode_name_falls_back() {
+        assert!(preview_name_matches_filter("文档/readme.md", "readme"));
+        assert!(preview_name_matches_filter("混合Mixed.txt", "mixed"));
     }
 }
 
